@@ -313,7 +313,21 @@ def add_vec_block_kernel(
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
     # Finish me!
+    off_x = block_id_x * B0 + tl.arange(0, B0)
+    off_y = block_id_y * B1 + tl.arange(0, B1)
 
+    mask_x = off_x < N0
+    mask_y = off_y < N1
+    x = tl.load(x_ptr + off_x, mask = mask_x, other = 0.0)
+    y = tl.load(y_ptr + off_y, mask = mask_y, other = 0.0)
+
+    z = x[None, :] + y[:, None]
+    # 这里是行优先,这样最快
+    off_z = off_y[:, None] * N0 + off_x[None, :]
+    
+    
+    mask_z = mask_x[None, :] & mask_y[:, None]
+    tl.store(z_ptr + off_z, z, mask = mask_z)
 
     return
 
@@ -342,6 +356,24 @@ def mul_relu_block_kernel(
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
     # Finish me!
+
+    off_x = block_id_x * B0 + tl.arange(0, B0)
+    off_y = block_id_y * B1 + tl.arange(0, B1)
+    mask_x = off_x < N0
+    mask_y = off_y < N1
+
+    x = tl.load(x_ptr + off_x, mask = mask_x, other = 0.0)
+    y = tl.load(y_ptr + off_y, mask = mask_y, other = 0.0)
+
+    tmp = x[None, :] * y[:, None]
+    z = tl.maximum(tmp, 0)
+
+    off_z = off_y[:, None] * N0 + off_x[None, :]
+    mask_z = mask_x[None, :] & mask_y[:, None]
+
+    tl.store(z_ptr + off_z, z, mask = mask_z)
+
+
     return
 
 
@@ -380,6 +412,14 @@ def mul_relu_block_back_kernel(
     block_id_i = tl.program_id(0)
     block_id_j = tl.program_id(1)
     # Finish me!
+    # 实现relu(x*y)对x的反向传播，dx
+    off_i = block_id_i * N0 + tl.arange(0, N0)
+    off_j = block_id_j * N1 + tl.arange(0, N1)
+
+    off_ij = off_j[:, None] * N1 + off_i[None, :]
+
+    
+
     return
 
 
