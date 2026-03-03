@@ -3,6 +3,7 @@ from typing import List
 import os
 
 import torch
+from torch.nn.intrinsic import BNReLU2d
 import triton
 import triton.language as tl
 
@@ -413,12 +414,24 @@ def mul_relu_block_back_kernel(
     block_id_j = tl.program_id(1)
     # Finish me!
     # 实现relu(x*y)对x的反向传播，dx
-    off_i = block_id_i * N0 + tl.arange(0, N0)
-    off_j = block_id_j * N1 + tl.arange(0, N1)
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    off_j = block_id_j * B1 + tl.arange(0, B1)
+    mask_i = off_i < N0
+    mask_j = off_j < N1
 
-    off_ij = off_j[:, None] * N1 + off_i[None, :]
+    off_ij = off_j[:, None] * N0 + off_i[None, :]
+    mask_ij = mask_i[None, :] & mask_j[:, None]
 
-    
+    # load到SRAM
+    x = tl.load(x_ptr + off_ij, mask=mask_ij, other=0.0)
+    y = tl.load(y_ptr + off_j, mask=mask_j, other=0.0)
+    dz = tl.load(dz_ptr + off_ij, mask=mask_ij, other=0.0)
+
+    tmp = x * y[:, None]
+    drelu = (tmp > 0)
+    dx = dz * y[:, None] * drelu
+
+    tl.store(dx_ptr + off_ij, dx, mask=mask_ij)
 
     return
 
@@ -445,6 +458,25 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    block_id = tl.program_id(0)
+    off_i = block_id * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+    
+    z = tl.zeros([B0], dtype=tl.float32) # N0 * 1
+
+
+    for j_start in range(0, T, B1):
+        off_j = j_start + tl.arange(0, B1)  
+        mask_j = off_j < T
+
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+
+        x = tl.load(x_ptr + off_ij, mask=mask_ij, other=0.0)
+        z += tl.sum(x, axis=1)
+    
+    tl.store(z_ptr + off_i, z, mask=mask_i)
+
     return
 
 
@@ -486,6 +518,50 @@ def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     # Finish me!
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+
+    x_max = tl.full([B0], -float("inf"), tl.float32)
+    x_sum = tl.full([B0], 0.0, tl.float32)
+
+    for j_start in tl.range(0, T, B1):
+        off_j = j_start + tl.arange(0, B1)
+        mask_j = off_j < T
+
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+
+        x = tl.load(x_ptr + off_ij, mask=mask_ij, other=-float("inf"))
+
+        max_new = tl.maximum(x_max, tl.max(x, axis=1))
+
+        x_sum *=  tl.exp2(log2_e * (x_max - max_new))
+        x_max = max_new
+        
+        # 加上当前列块的值
+        x_shifted = x - x_max[:, None]
+        x_sum += tl.sum(tl.exp2(log2_e * x_shifted), axis=1)
+
+        
+    
+    for j_start in tl.range(0, T, B1):
+        off_j = j_start + tl.arange(0, B1)
+        mask_j = off_j < T
+
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+
+
+        x = tl.load(x_ptr + off_ij, mask=mask_ij, other=-float("inf"))
+        
+        x_exp = tl.exp2(log2_e * (x - x_max[:, None]))
+
+        z = x_exp / x_sum[:, None]
+
+    
+        tl.store(z_ptr + off_ij, z, mask=mask_ij)
+
+
     return
 
 
@@ -497,6 +573,49 @@ def softmax_kernel_brute_force(
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     # Finish me!
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+
+    x_max = tl.full([B0], -float("inf"), tl.float32)
+    for j_start in tl.range(0, T, B1):
+        off_j = j_start + tl.arange(0, B1)
+        mask_j = off_j < T
+
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+
+        x = tl.load(x_ptr + off_ij, mask=mask_ij, other=-float("inf"))
+        x_max = tl.maximum(x_max, tl.max(x, axis=1))
+
+
+    x_sum = tl.full([B0], 0.0, tl.float32)
+    for j_start in tl.range(0, T, B1):
+        off_j = j_start + tl.arange(0, B1)
+        mask_j = off_j < T
+
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+
+        x = tl.load(x_ptr + off_ij, mask=mask_ij, other=-float("inf"))
+        x_shifted = x - x_max[:,None]
+        x_exp = tl.exp2(log2_e * x_shifted)
+        x_sum += tl.sum(x_exp, axis=1)
+    
+    for j_start in tl.range(0, T, B1):
+        off_j = j_start + tl.arange(0, B1)
+        mask_j = off_j < T
+
+        off_ij = off_i[:, None] * T + off_j[None, :]
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+
+        x = tl.load(x_ptr + off_ij, mask=mask_ij, other=-float("inf"))
+        x_shifted = x - x_max[:,None]
+        x_exp = tl.exp2(log2_e * x_shifted)
+        
+        z = x_exp / x_sum[:, None]
+        tl.store(z_ptr + off_ij, z, mask=mask_ij)
+
+
     return
 
 
@@ -535,6 +654,20 @@ def flashatt_kernel(
     log2_e = 1.44269504
     myexp = lambda x: tl.exp2(log2_e * x)
     # Finish me!
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+
+    q = tl.load(q_ptr + off_i, mask=mask_i, other=0.0)
+    
+    for j_start in tl.arange(0, T, B1):
+        off_j = j_start + tl.range(0, B1)
+        mask_j = off_j < T
+
+        k = tl.load(k_ptr + off_j, mask=mask_j, other=0.0)
+        v = tl.load(k_ptr + off_j, mask=mask_j, other=0.0)
+        
+
+
     return
 
 
