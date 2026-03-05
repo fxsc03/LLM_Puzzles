@@ -870,7 +870,7 @@ def quant_dot_kernel(
     mask_j = off_j < N0
     mask_k = off_k < N1
 
-    z = tl.zeros((B0, B1), dtype=tl.float32)
+    # z = tl.zeros((B0, B1), dtype=tl.float32)
     off_z = off_j[:, None] * N1 + off_k[None, :]
     mask_z = mask_j[:, None] & mask_k[None, :]
 

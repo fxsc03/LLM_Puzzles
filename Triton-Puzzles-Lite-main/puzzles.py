@@ -2,6 +2,7 @@ import argparse
 from typing import List
 import os
 
+from sympy import O
 import torch
 from torch.nn.intrinsic import BNReLU2d
 import triton
@@ -652,20 +653,54 @@ def flashatt_kernel(
 ):
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
-    myexp = lambda x: tl.exp2(log2_e * x)
+    # myexp = lambda x: tl.exp2(log2_e * x)
     # Finish me!
     off_i = block_id_i * B0 + tl.arange(0, B0)
     mask_i = off_i < N0
 
     q = tl.load(q_ptr + off_i, mask=mask_i, other=0.0)
     
-    for j_start in tl.arange(0, T, B1):
-        off_j = j_start + tl.range(0, B1)
+    x_sum = tl.full([B0], 0.0, tl.float32)
+    x_max = tl.full([B0], -float("inf"), tl.float32)
+
+    for j_start in tl.range(0, T, B1):
+        off_j = j_start + tl.arange(0, B1)
+        mask_j = off_j < T
+
+        k = tl.load(k_ptr + off_j, mask=mask_j, other=-float("inf"))
+        # v = tl.load(v_ptr + off_j, mask=mask_j, other=0.0)
+        
+        
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+
+        x = tl.where(mask_ij, q[:, None] * k[None, :], -float("inf"))
+        max_now = tl.maximum(x_max, tl.max(x, axis=1))
+        x_sum *= tl.exp2(log2_e * (x_max - max_now))
+        x_max = max_now
+
+        x_shifted = x - x_max[:, None]
+        x_sum += tl.sum(tl.exp2(log2_e * x_shifted), axis=1)
+
+
+    z = tl.full([B0], 0.0, tl.float32)
+
+    for j_start in tl.range(0, T, B1):
+        off_j = j_start + tl.arange(0, B1)
         mask_j = off_j < T
 
         k = tl.load(k_ptr + off_j, mask=mask_j, other=0.0)
-        v = tl.load(k_ptr + off_j, mask=mask_j, other=0.0)
+        v = tl.load(v_ptr + off_j, mask=mask_j, other=0.0)
         
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.where(mask_ij, q[:, None] * k[None, :], -float("inf"))
+        
+        x_exp = tl.exp2(log2_e * (x - x_max[:, None]))
+        
+        u = x_exp / x_sum[:, None]
+        z += tl.sum(v[None, :] * u, axis=1)
+        
+        
+    tl.store(z_ptr + off_i, z, mask=mask_i)
 
 
     return
@@ -701,6 +736,30 @@ def conv2d_kernel(
 ):
     block_id_i = tl.program_id(0)
     # Finish me!
+
+    # N0是通道数，每个线程处理一个完整的通道
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = off_i < N0
+
+    off_KH = tl.arange(0, KH)
+    off_KW = tl.arange(0, KW)
+    off_KHKW = off_KH[:, None] * KW + off_KW[None, :]
+
+    k = tl.load(k_ptr + off_KHKW)
+
+    for h in tl.range(0, H):
+        for w in tl.range(0, W):
+            off_h = h + off_KH[None, :, None]
+            off_w = w + off_KW[None, None, :]
+            off_x = off_i[:, None, None] * H * W + off_h * W + off_w
+            mask_x = (off_h < H) & (off_w < W) 
+
+            x = tl.load(x_ptr + off_x, mask=mask_x)
+            z = x * k[None, :]
+            z = tl.sum(tl.sum(z, 2), 1)
+            off_z = off_i * H * W + h * W + w
+            tl.store(z_ptr + off_z, z)
+
     return
 
 
@@ -743,10 +802,44 @@ def dot_kernel(
     B2: tl.constexpr,
     B_MID: tl.constexpr,
 ):
-    block_id_j = tl.program_id(0)
-    block_id_k = tl.program_id(1)
-    block_id_i = tl.program_id(2)
+    block_id_j = tl.program_id(0) # N0
+    block_id_k = tl.program_id(1) # N1
+    block_id_i = tl.program_id(2) # N2
     # Finish me!
+    
+    off_j = block_id_j * B0 + tl.arange(0, B0)
+    off_k = block_id_k * B1 + tl.arange(0, B1)
+    off_i = block_id_i * B2 + tl.arange(0, B2) # 通道
+
+    mask_j = off_j < N0
+    mask_k = off_k < N1
+    mask_i = off_i < N2
+
+    z = tl.full([B2, B0, B1], 0.0, tl.float32)
+    mask_z = mask_i[:, None, None] & mask_j[None, :, None] & mask_k[None, None, :]
+
+    for l_start in tl.range(0, MID, B_MID):
+
+        # 先找x,y的off
+        off_l = l_start + tl.arange(0, B_MID)
+        mask_mid = off_l < MID
+        off_x = off_i[:, None, None] * N0 * MID + off_j[None, :, None] * MID + off_l[None, None, :]
+        off_y = off_i[:, None, None] * MID * N1 + off_l[None, :, None] * N1 + off_k[None, None, :]
+
+        mask_x = mask_i[:, None, None] & mask_j[None, :, None] & mask_mid[None, None, :]
+        mask_y = mask_i[:, None, None] & mask_mid[None, :, None] & mask_k[None, None, :]
+
+        x = tl.load(x_ptr + off_x, mask=mask_x)
+        y = tl.load(y_ptr + off_y, mask=mask_y)
+
+        z += tl.dot(x, y)
+    
+    
+    off_z = off_i[:, None, None] * N0 * N1 + off_j[None, :, None] * N1 + off_k[None, None, :]
+
+    
+    tl.store(z_ptr + off_z, z, mask=mask_z)
+
     return
 
 
@@ -813,6 +906,64 @@ def quant_dot_kernel(
     block_id_j = tl.program_id(0)
     block_id_k = tl.program_id(1)
     # Finish me!
+    off_j = block_id_j * B0 + tl.arange(0, B0)
+    off_k = block_id_k * B1 + tl.arange(0 ,B1)
+    mask_j = off_j < N0
+    mask_k = off_k < N1
+
+    off_z = off_j[:, None] * N1 + off_k[None, :]
+    mask_z = mask_j[:, None] & mask_k[None, :]
+
+    z = tl.full([B0, B1], 0.0, tl.float32)
+
+    # W_real = scale * (W_int4 - offset)
+    for m_start in tl.range(0, MID, B_MID):
+        # load scale
+        off_s = (m_start // GROUP) + tl.arange(0, B_MID // GROUP)
+        mask_s = off_s < (MID // GROUP)
+
+        off_scale = off_j[:, None] * (MID // GROUP) + off_s[None, :]
+        mask_scale = mask_j[:, None] & mask_s[None, :]
+        scale = tl.load(scale_ptr + off_scale, mask=mask_scale)
+
+        # load offset
+        off_o = (m_start // GROUP // FPINT) + tl.arange(0, B_MID // GROUP // FPINT)
+        mask_o = off_o < (MID // GROUP // FPINT)
+
+        off_offset = off_j[:, None] * (MID // GROUP // FPINT) + off_o[None, :]
+        mask_offset = mask_j[:, None] & mask_o[None, :]
+        offset = tl.load(offset_ptr + off_offset, mask=mask_offset)
+
+        # load weight
+        off_w = (m_start // FPINT) + tl.arange(0, B_MID // FPINT)
+        mask_w = off_w < (MID // FPINT)
+
+        off_weight = off_j[:, None] * (MID // FPINT) + off_w[None, :]
+        mask_weight = mask_j[:, None] & mask_w[None, :]
+        weight = tl.load(weight_ptr + off_weight, mask=mask_weight)
+
+        # load activation
+        off_a = m_start + tl.arange(0, B_MID)
+        mask_a = off_a < MID
+
+        off_activation = off_a[:, None] * N1 + off_k
+        mask_activation = mask_a[:, None] & mask_k[None, :]
+        activation = tl.load(activation_ptr + off_activation, mask=mask_activation)
+
+        # caculate
+        # FPINT表示有几个数, 每个数的长度是BITS
+        BITS = 32 // FPINT
+        unpack_offs = tl.arange(0, FPINT) * BITS
+        unpack_mask = (1 << BITS) - 1
+        unpacked_offset = (offset >> unpack_offs) & unpack_mask
+        unpacked_weight = (weight[:, :, None] >> unpack_offs) & unpack_mask
+
+        transformed_weight = scale[:, :, None] * (unpacked_weight - unpacked_offset[:, :, None])
+        transformed_weight = transformed_weight.reshape(B0, B_MID)
+        z += tl.dot(transformed_weight, activation)
+    
+    tl.store(z_ptr + off_z, mask=mask_z)
+
     return
 
 
